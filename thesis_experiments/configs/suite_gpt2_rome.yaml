@@ -1,0 +1,40 @@
+# =========================
+# Model configuration
+# =========================
+model_name: gpt2-xl
+model_class: GPT2LMHeadModel
+tokenizer_class: GPT2Tokenizer
+tokenizer_name: gpt2-xl
+
+# Device configuration
+# NOTE: EasyEdit expects CUDA here
+device: 0
+model_parallel: false
+
+# =========================
+# ROME-specific parameters
+# =========================
+layers: [17]
+fact_token: subject_last
+
+# Experiment / probes (custom fields read by our script)
+exp_max_new_tokens: 20
+exp_topk: 5
+exp_topk_fallback: 50
+exp_suppress_internal_prints: true
+exp_verbose: false
+
+# ROME updates this weight (your logs showed layer 17 c_proj)
+exp_weight_probe_name: transformer.h.17.mlp.c_proj.weight
+
+
+# Optimization
+lr: 1e-3
+n_steps: 20
+kl_factor: 0.1
+weight_decay: 0.0
+
+# =========================
+# Misc
+# =========================
+fp16: true
