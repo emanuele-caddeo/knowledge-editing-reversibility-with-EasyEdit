@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 import torch
@@ -16,6 +17,7 @@ from .tok_dataset import (
     flatten_masked_batch,
     length_collation,
 )
+print("[STATS] layer_stats.py LOADED FROM:", __file__, flush=True)
 
 STAT_TYPES = {
     "mom2": SecondMoment,
@@ -154,7 +156,7 @@ def layer_stats(
     dtype = getattr(torch, precision)
     size_suffix = "" if sample_size is None else f"_{sample_size}"
     if batch_tokens < npos:
-        size_suffix = "_t{batch_tokens}" + size_suffix
+        size_suffix = f"_t{batch_tokens}" + size_suffix
     if model_name is None:
         # model_name = model.config._name_or_path.replace("/", "_")
         model_name = model.config._name_or_path.rsplit("/")[-1]
@@ -180,22 +182,52 @@ def layer_stats(
         collate_fn=length_collation(batch_tokens),
         pin_memory=True,
         random_sample=1,
-        num_workers=2,
+        num_workers = 0 if os.name == "nt" else min(4, os.cpu_count() or 1),
     )
-    batch_count = -(-(sample_size or len(ds)) // batch_size)
+    # Compute total number of batches for progress
+    if sample_size is not None:
+        n_items = sample_size
+    else:
+        # If we are loading from cache, ds may be None; in that case we don't know the total.
+        n_items = len(ds) if ds is not None else None
+
+    batch_count = (n_items + batch_size - 1) // batch_size if n_items is not None else None
+
+    # Resolve device safely
+    if hparams is not None and hasattr(hparams, "device") and hparams.device is not None:
+        # Convention: -1 means CPU
+        dev = "cpu" if str(hparams.device) == "-1" else f"cuda:{hparams.device}"
+    else:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+    print("[STATS] loader ready, entering loop...")
+    sys.stdout.flush()
+
     with torch.no_grad():
-        for batch_group in progress(loader, total=batch_count):
-            for batch in batch_group:
-                batch = dict_to_(batch, f"cuda:{hparams.device}")
-                with Trace(
-                    model, layer_name, retain_input=True, retain_output=False, stop=True
-                ) as tr:
-                    model(**batch)
-                feats = flatten_masked_batch(tr.input, batch["attention_mask"])
-                # feats = flatten_masked_batch(tr.output, batch["attention_mask"])
-                feats = feats.to(dtype=dtype)
-                stat.add(feats)
+        pbar = tqdm(
+            total=batch_count,
+            desc="ROME stats (mom2)",
+            unit="batch",
+            dynamic_ncols=True,
+            file=sys.stdout,      # force stdout
+            leave=True,
+            mininterval=0.5,
+        )
+        pbar.refresh()            # force render immediately
+        try:
+            for batch_group in loader:
+                for batch in batch_group:
+                    batch = dict_to_(batch, dev)
+                    with Trace(model, layer_name, retain_input=True, retain_output=False, stop=True) as tr:
+                        model(**batch)
+                    feats = flatten_masked_batch(tr.input, batch["attention_mask"])
+                    feats = feats.to(dtype=dtype)
+                    stat.add(feats)
+                pbar.update(1)
+        finally:
+            pbar.close()
+
     return stat
+
 
 
 if __name__ == "__main__":
