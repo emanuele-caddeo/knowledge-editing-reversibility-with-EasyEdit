@@ -20,3 +20,6 @@ delta.txt
 **/*_test_reps*
 *test_reps
 *test_reps.*
+# ROME/MEMIT cached stats (generated artifacts)
+thesis_experiments/stats/
+*.npz
