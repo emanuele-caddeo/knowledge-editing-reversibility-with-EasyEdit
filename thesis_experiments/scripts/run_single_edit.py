@@ -5,7 +5,6 @@ import yaml
 import warnings
 
 from thesis_experiments.scripts.utils_io import load_knowedit_records_flexible, print_log
-
 # ----------------------------
 # Clean warnings
 # ----------------------------

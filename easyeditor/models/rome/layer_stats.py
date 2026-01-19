@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+from contextlib import nullcontext
 
 import torch
 from datasets import load_dataset
@@ -17,6 +18,7 @@ from .tok_dataset import (
     flatten_masked_batch,
     length_collation,
 )
+
 print("[STATS] layer_stats.py LOADED FROM:", __file__, flush=True)
 
 STAT_TYPES = {
@@ -90,105 +92,127 @@ def layer_stats(
     download=True,
     progress=tqdm,
     force_recompute=False,
-    hparams=None
+    hparams=None,
 ):
     """
-    Function to load or compute cached stats.
+    Load or compute cached ROME stats (e.g., mom2).
+    Adds an optional progress bar (tqdm-like factory) shown only during computation.
     """
 
     def get_ds():
-        # Load_From_File
-        # from datasets import Dataset
-        # raw_ds = Dataset.from_file('XXX/XXX/wikipedia-train.arrow')
-        # raw_ds = {'train': raw_ds}
+        # raw_ds = load_dataset(ds_name, subset_name)
         raw_ds = load_dataset(
             ds_name,
-            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name]
+            dict(wikitext="wikitext-103-raw-v1", wikipedia="20200501.en")[ds_name],
         )
-        if hasattr(model.config, 'n_positions'):
+
+        if hasattr(model.config, "n_positions"):
             maxlen = model.config.n_positions
-        elif hasattr(model.config, 'max_sequence_length'):
+        elif hasattr(model.config, "max_sequence_length"):
             maxlen = model.config.max_sequence_length
-        elif hasattr(model.config, 'max_position_embeddings'):
+        elif hasattr(model.config, "max_position_embeddings"):
             maxlen = model.config.max_position_embeddings
-        elif hasattr(model.config,'seq_length'):
+        elif hasattr(model.config, "seq_length"):
             maxlen = model.config.seq_length
         else:
             raise NotImplementedError
-                
-        if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
-            if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
+
+        if hasattr(model.config, "model_type") and "mistral" in model.config.model_type:
+            if hasattr(model.config, "sliding_window") and model.config.sliding_window:
                 maxlen = model.config.sliding_window or 4096
             else:
                 maxlen = 4096
-        if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
+
+        if hasattr(model.config, "model_type") and "qwen2" in model.config.model_type:
             maxlen = 4096
 
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
+
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
 
     # Continue with computation of statistics
     batch_size = 100  # Examine this many dataset texts at once
-    if hasattr(model.config, 'n_positions'):
+
+    if hasattr(model.config, "n_positions"):
         npos = model.config.n_positions
-    elif hasattr(model.config, 'max_sequence_length'):
+    elif hasattr(model.config, "max_sequence_length"):
         npos = model.config.max_sequence_length
-    elif hasattr(model.config, 'max_position_embeddings'):
+    elif hasattr(model.config, "max_position_embeddings"):
         npos = model.config.max_position_embeddings
-    elif hasattr(model.config,'seq_length'):
+    elif hasattr(model.config, "seq_length"):
         npos = model.config.seq_length
     else:
         raise NotImplementedError
-        
-    if hasattr(model.config, 'model_type') and 'mistral' in model.config.model_type:
-        if hasattr(model.config, 'sliding_window') and model.config.sliding_window:
+
+    if hasattr(model.config, "model_type") and "mistral" in model.config.model_type:
+        if hasattr(model.config, "sliding_window") and model.config.sliding_window:
             npos = model.config.sliding_window or 4096
         else:
             npos = 4096
-    if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
-            npos = 4096
+
+    if hasattr(model.config, "model_type") and "qwen2" in model.config.model_type:
+        npos = 4096
 
     if batch_tokens is None:
         batch_tokens = npos * 3  # Sort and divide into batches with this many tokens
+
     if precision is None:
         precision = "float64"
     dtype = getattr(torch, precision)
+
     size_suffix = "" if sample_size is None else f"_{sample_size}"
     if batch_tokens < npos:
         size_suffix = f"_t{batch_tokens}" + size_suffix
+
     if model_name is None:
-        # model_name = model.config._name_or_path.replace("/", "_")
         model_name = model.config._name_or_path.rsplit("/")[-1]
 
     stats_dir = Path(stats_dir)
-    file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_{'-'.join(sorted(to_collect))}{size_suffix}.npz"
+    file_extension = (
+        f"{model_name}/{ds_name}_stats/"
+        f"{layer_name}_{precision}_{'-'.join(sorted(to_collect))}{size_suffix}.npz"
+    )
     filename = stats_dir / file_extension
+    filename.parent.mkdir(parents=True, exist_ok=True)
+    print("\n[ROME STATS CHECK]", flush=True)
+    print(f"[ROME STATS CHECK] stats_dir base : {stats_dir}", flush=True)
+    print(f"[ROME STATS CHECK] cache file    : {filename}", flush=True)
+    print(f"[ROME STATS CHECK] exists         : {filename.exists()}", flush=True)
 
-    print(f"Computing Cov locally....")
+    # Decide whether we compute or load from cache
+    # - compute if force_recompute OR cache file doesn't exist
+    # - otherwise load from cache (ds=None)
+    will_compute = force_recompute or (not filename.exists())
+    print(
+        f"[ROME STATS CHECK] mode           : "
+        f"{'COMPUTE (rebuild stats)' if will_compute else 'CACHE (load existing)'}",
+        flush=True
+    )
+    ds = get_ds() if will_compute else None
 
-    ds = get_ds() if not filename.exists() else None
-
-    if progress is None:
-        progress = lambda x: x
+    # Cache handling:
+    # - if recompute -> do not use cache during tally; tally will compute and write new file
+    # - if not recompute -> allow tally to load from cache
+    cache_path = None if force_recompute else filename
 
     stat = CombinedStat(**{k: STAT_TYPES[k]() for k in to_collect})
     loader = tally(
         stat,
         ds,
-        cache=(filename if not force_recompute else None),
+        cache=cache_path,
         sample_size=sample_size,
         batch_size=batch_size,
         collate_fn=length_collation(batch_tokens),
         pin_memory=True,
         random_sample=1,
-        num_workers = 0 if os.name == "nt" else min(4, os.cpu_count() or 1),
+        num_workers=0 if os.name == "nt" else min(4, os.cpu_count() or 1),
     )
+
     # Compute total number of batches for progress
     if sample_size is not None:
         n_items = sample_size
     else:
-        # If we are loading from cache, ds may be None; in that case we don't know the total.
         n_items = len(ds) if ds is not None else None
 
     batch_count = (n_items + batch_size - 1) // batch_size if n_items is not None else None
@@ -199,35 +223,47 @@ def layer_stats(
         dev = "cpu" if str(hparams.device) == "-1" else f"cuda:{hparams.device}"
     else:
         dev = "cuda" if torch.cuda.is_available() else "cpu"
-    print("[STATS] loader ready, entering loop...")
-    sys.stdout.flush()
 
-    with torch.no_grad():
-        pbar = tqdm(
+    # Progress bar: show only when we are actually computing
+    # Use `progress` factory if provided; otherwise, no progress output.
+    pbar_cm = nullcontext()
+    if will_compute and progress is not None:
+        pbar_cm = progress(
             total=batch_count,
-            desc="ROME stats (mom2)",
+            desc="Computing ROME mom2",
             unit="batch",
             dynamic_ncols=True,
-            file=sys.stdout,      # force stdout
+            file=sys.stdout,
             leave=True,
             mininterval=0.5,
         )
-        pbar.refresh()            # force render immediately
-        try:
+
+    print(f"[STATS] stats_path: {filename}", flush=True)
+    print(f"[STATS] mode: {'COMPUTE' if will_compute else 'CACHE'}", flush=True)
+    print("[STATS] loader ready, entering loop...", flush=True)
+
+    with torch.no_grad():
+        with pbar_cm as pbar:
             for batch_group in loader:
                 for batch in batch_group:
                     batch = dict_to_(batch, dev)
-                    with Trace(model, layer_name, retain_input=True, retain_output=False, stop=True) as tr:
+                    with Trace(
+                        model,
+                        layer_name,
+                        retain_input=True,
+                        retain_output=False,
+                        stop=True,
+                    ) as tr:
                         model(**batch)
+
                     feats = flatten_masked_batch(tr.input, batch["attention_mask"])
                     feats = feats.to(dtype=dtype)
                     stat.add(feats)
-                pbar.update(1)
-        finally:
-            pbar.close()
+
+                if pbar is not None:
+                    pbar.update(1)
 
     return stat
-
 
 
 if __name__ == "__main__":

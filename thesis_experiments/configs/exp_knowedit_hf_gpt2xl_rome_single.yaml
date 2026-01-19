@@ -1,62 +1,23 @@
-# ============================================================
-# ROME Hyperparameters (EasyEdit)
-# Model: gpt2-xl
-# ============================================================
+# Experiment config (thesis_experiments) - only high-level run settings
 
-alg_name: "ROME"
-model_name: "gpt2-xl"
-exp_hparams_path: thesis_experiments/configs/hparams_rome_gpt2xl.yaml
+exp_method: "rome"
+exp_hparams_path: "thesis_experiments/configs/hparams_rome_gpt2xl.yaml"
 
-
+# Dataset source (HF)
 hf_dataset: "zjunlp/KnowEdit"
 hf_split: "test"
 hf_subset: null
 
+# (Optional) Local dataset alternative (leave empty if using HF)
+exp_dataset_path: ""
+
+# Sample selection
 exp_sample_k: null
 exp_sample_index: 0
 exp_seed: 42
 
-# --- Required by this EasyEdit fork's ROMEHyperParams ---
-v_weight_decay: 0.0
-kl_factor: 0.0
-mom2_adjustment: true
-
-# Second-moment (mom2) stats settings
-mom2_dataset: "wikipedia"
-mom2_n_samples: 10000
-mom2_dtype: "float32"
-
-# -----------------------------
-# Core ROME parameters
-# -----------------------------
-layers: [17]
-fact_token: "subject_last"
-
-v_num_grad_steps: 20
-v_lr: 0.1
-v_loss_layer: 0
-clamp_norm_factor: 4.0
-
-# -----------------------------
-# Module templates (GPT-2)
-# -----------------------------
-rewrite_module_tmp: "transformer.h.{}.mlp.c_proj"
-layer_module_tmp: "transformer.h.{}"
-mlp_module_tmp: "transformer.h.{}.mlp"
-attn_module_tmp: "transformer.h.{}.attn"
-
-ln_f_module: "transformer.ln_f"
-lm_head_module: "lm_head"
-
-# -----------------------------
-# Context handling
-# -----------------------------
-context_template_length_params:
-  - [5, 5]
-  - [10, 10]
-
-# -----------------------------
-# Runtime
-# -----------------------------
-stats_dir: null
-device: 0
+# Model/runtime controls for this runner
+exp_forced_model_name: "gpt2-xl"
+exp_max_new_tokens: 20
+exp_suppress_internal_prints: false
+exp_verbose: false
