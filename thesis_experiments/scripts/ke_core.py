@@ -2,18 +2,25 @@ import io
 import os
 import warnings
 from contextlib import redirect_stdout, redirect_stderr
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import torch
 from transformers import AutoTokenizer
+from transformers.utils import logging as hf_logging
 
 from easyeditor import BaseEditor, ROMEHyperParams, MEMITHyperParams
 
 
+# ----------------------------
 # Keep console clean
+# ----------------------------
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*deprecated.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
+
+# Transformers sometimes emits deprecation notices via its own logger, not `warnings`.
+# This helps keep experiment logs readable.
+hf_logging.set_verbosity_error()
 
 
 def load_hparams(method: str, hparams_path: str):
@@ -36,7 +43,14 @@ def get_tokenizer(editor: BaseEditor, model_name: str):
 
 
 @torch.no_grad()
-def generate_completion(model, tokenizer, prompt: str, max_new_tokens: int) -> str:
+def generate_completion(
+    model,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    temperature: float = 1.0,
+    do_sample: bool = False,
+) -> str:
     device = next(model.parameters()).device
     inputs = tokenizer(prompt, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -44,7 +58,8 @@ def generate_completion(model, tokenizer, prompt: str, max_new_tokens: int) -> s
     out_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
-        do_sample=False,  # greedy
+        do_sample=do_sample,
+        temperature=temperature,
         num_beams=1,
         pad_token_id=tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
@@ -61,60 +76,92 @@ def apply_edit(
     target_new: str,
     verbose: bool,
     suppress_internal_prints: bool,
+    locality_prompts: List = None,
+    portability_prompts: List = None,
 ):
     """
     Persistent edit by design: sequential_edit=True.
+
+    EasyEdit expects:
+      - rephrase_prompts: List[str] (paraphrases for the rewrite prompt)
+      - locality_inputs: Dict[str, Dict[str, List[List[str]] or List[str]]]
+        where outer list length == num_edits (here: 1)
+      - portability_inputs: similar structure (optional)
+
+    We provide a minimal nested structure:
+      locality_inputs["neighborhood"]["prompt"] = [ [p1, p2, ...] ]
+      locality_inputs["neighborhood"]["ground_truth"] = [ [gt1, gt2, ...] ]
     """
-    kwargs = dict(
+    kwargs: Dict[str, Any] = dict(
         prompts=[prompt],
         ground_truth=[ground_truth],
         target_new=[target_new],
-        subject=[subject],
+        subject=[subject],  # accepted via **kwargs in EasyEdit
         sequential_edit=True,
         verbose=verbose,
         test_generation=False,
     )
 
+    # ----------------------------
+    # Portability -> rephrase_prompts (+ optional portability_inputs)
+    # ----------------------------
+    if portability_prompts:
+        rp: List[str] = []
+        for x in portability_prompts:
+            if isinstance(x, dict):
+                rp.append(str(x.get("prompt", "")))
+            else:
+                rp.append(str(x))
+        rp = [p for p in rp if p.strip()]
+
+        if rp:
+            kwargs["rephrase_prompts"] = rp
+            kwargs["portability_inputs"] = {
+                "rephrase": {
+                    "prompt": [rp],
+                    # If you don't have gold answers for paraphrases,
+                    # a common fallback is to use the new target.
+                    "ground_truth": [[target_new] * len(rp)],
+                }
+            }
+
+    # ----------------------------
+    # Locality -> locality_inputs (nested lists: one entry per edit)
+    # ----------------------------
+    if locality_prompts:
+        lp: List[str] = []
+        gt_lp: List[str] = []
+
+        for x in locality_prompts:
+            if isinstance(x, dict):
+                lp.append(str(x.get("prompt", "")))
+                # Try common keys if present
+                gt_lp.append(str(x.get("ground_truth", x.get("answer", x.get("target", "")))))
+            else:
+                lp.append(str(x))
+                gt_lp.append("")  # placeholder if no gold label is available
+
+        lp = [p for p in lp if p.strip()]
+
+        # IMPORTANT: outer list length must match num_edits (=1)
+        kwargs["locality_inputs"] = {
+            "neighborhood": {
+                "prompt": [lp],
+                "ground_truth": [gt_lp],
+            }
+        }
+
+    # ----------------------------
+    # Execute
+    # ----------------------------
     if suppress_internal_prints:
         buf_out, buf_err = io.StringIO(), io.StringIO()
         with redirect_stdout(buf_out), redirect_stderr(buf_err):
             metrics, edited_model, _ = editor.edit(**kwargs)
         return metrics, edited_model
+
     metrics, edited_model, _ = editor.edit(**kwargs)
     return metrics, edited_model
-
-
-def _unwrap_metric(value: Any):
-    # Unwrap list like [np.float64(1.0)]
-    if isinstance(value, list) and len(value) == 1:
-        value = value[0]
-    try:
-        return float(value)
-    except Exception:
-        return value
-
-
-def format_metrics_nude(metrics: List[Dict[str, Any]]) -> str:
-    """
-    Returns a clean string with only scalar values (no np.float64, no [x]).
-    Keeps empty dicts as-is.
-    """
-    lines: List[str] = []
-    for i, case in enumerate(metrics):
-        lines.append(f"[CASE {i}]")
-
-        pre = case.get("pre", {})
-        post = case.get("post", {})
-
-        lines.append("  PRE:")
-        for k, v in pre.items():
-            lines.append(f"    {k}: {_unwrap_metric(v)}")
-
-        lines.append("  POST:")
-        for k, v in post.items():
-            lines.append(f"    {k}: {_unwrap_metric(v)}")
-
-    return "\n".join(lines)
 
 
 def force_hf_home():

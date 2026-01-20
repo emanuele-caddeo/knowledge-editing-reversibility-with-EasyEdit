@@ -19,8 +19,6 @@ from .tok_dataset import (
     length_collation,
 )
 
-print("[STATS] layer_stats.py LOADED FROM:", __file__, flush=True)
-
 STAT_TYPES = {
     "mom2": SecondMoment,
     "mean": Mean,

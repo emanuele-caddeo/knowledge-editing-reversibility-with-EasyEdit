@@ -3,7 +3,6 @@ import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 def read_json_any(path: str) -> Any:
     """Read JSON or JSONL (one JSON object per line)."""
     p = Path(path)

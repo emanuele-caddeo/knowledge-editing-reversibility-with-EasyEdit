@@ -1,23 +1,31 @@
-# Experiment config (thesis_experiments) - only high-level run settings
+# Experiment config (thesis_experiments)
+# This file controls: dataset source + sample selection + runner options.
+# ROME/MEMIT algorithm hyperparameters live ONLY in exp_hparams_path.
 
 exp_method: "rome"
 exp_hparams_path: "thesis_experiments/configs/hparams_rome_gpt2xl.yaml"
 
-# Dataset source (HF)
-hf_dataset: "zjunlp/KnowEdit"
+# Dataset type: "knowedit" or "counterfact"
+exp_dataset_type: "counterfact"
+
+# Dataset source (choose ONE):
+# - HuggingFace dataset:
+hf_dataset: "azhx/counterfact"
 hf_split: "test"
 hf_subset: null
 
-# (Optional) Local dataset alternative (leave empty if using HF)
+# - Local dataset path (JSON/JSONL):
 exp_dataset_path: ""
 
-# Sample selection
+# Sampling / selection
 exp_sample_k: null
-exp_sample_index: 0
+exp_sample_index: 100
 exp_seed: 42
 
-# Model/runtime controls for this runner
+# Runner controls
 exp_forced_model_name: "gpt2-xl"
-exp_max_new_tokens: 20
-exp_suppress_internal_prints: false
+exp_max_new_tokens: 5
+exp_temperature: 0.7
+exp_do_sample: true
+exp_suppress_internal_prints: true
 exp_verbose: false

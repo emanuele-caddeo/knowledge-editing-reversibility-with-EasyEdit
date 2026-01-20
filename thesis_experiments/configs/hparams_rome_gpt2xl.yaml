@@ -1,4 +1,5 @@
 # EasyEdit ROME hyperparameters (consumed by load_hparams)
+# Keep ALL ROME-related settings here (mom2, layers, stats_dir, device, etc.)
 
 alg_name: "ROME"
 model_name: "gpt2-xl"
