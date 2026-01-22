@@ -1,10 +1,12 @@
-import sys 
+import sys
 import inspect
 from pathlib import Path
 import argparse
 import yaml
 import warnings
-from typing import Any, Dict
+from typing import Any, Dict, List
+
+import torch
 
 # ----------------------------
 # Clean warnings
@@ -13,12 +15,9 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", message=".*deprecated.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 
-import numpy as np
-from tabulate import tabulate
-
 from thesis_experiments.scripts.utils_io import (
-    print_log, 
-    _resolve_path_like_cfg, 
+    print_log,
+    _resolve_path_like_cfg,
     raise_path_error,
     _load_records,
     _normalize_record,
@@ -26,10 +25,18 @@ from thesis_experiments.scripts.utils_io import (
     _as_int,
     _as_bool,
 )
+
 from thesis_experiments.scripts.pretty_print_utilities import (
-    print_metrics_table, 
-    print_hparams_table, 
-    print_color
+    print_metrics_table,
+    print_hparams_table,
+    print_color,
+)
+
+from thesis_experiments.scripts.butterfly_effect_ppl import (
+    load_ppl_texts_from_json,
+    compute_ppl,
+    butterfly_report,
+    is_collapse,
 )
 
 from ke_core import (
@@ -39,7 +46,9 @@ from ke_core import (
     generate_completion,
     apply_edit,
 )
+
 from easyeditor import BaseEditor
+
 
 def _call_apply_edit(editor: BaseEditor, **kwargs):
     """
@@ -65,7 +74,7 @@ def _call_apply_edit(editor: BaseEditor, **kwargs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run sample with forward + inverse (rollback). Uses separate experiment config + hparams YAML."
+        description="Run sample with forward + inverse (rollback) + Butterfly Effect (PPL)."
     )
     parser.add_argument("--config", required=True, help="Path to experiment config YAML")
     parser.add_argument("--mode", default="both", choices=["forward", "inverse", "both"])
@@ -99,7 +108,6 @@ def main():
     if not exp_hparams_path.exists():
         raise_path_error("Hparams config file", exp_hparams_path)
 
-    # Optional sanity-check: ensure hparams file has alg_name
     hparams_cfg = yaml.safe_load(exp_hparams_path.read_text(encoding="utf-8")) or {}
     if not isinstance(hparams_cfg, dict):
         raise ValueError(f"Invalid hparams YAML structure (expected mapping) in: {exp_hparams_path}")
@@ -117,10 +125,35 @@ def main():
     suppress_internal = _as_bool(cfg.get("exp_suppress_internal_prints", True), True)
     verbose = _as_bool(cfg.get("exp_verbose", False), False)
 
-    
-
     if max_new_tokens <= 0:
         raise ValueError(f"exp_max_new_tokens must be > 0. Got: {max_new_tokens}")
+
+    # ----------------------------
+    # Butterfly Effect (PPL) config
+    # ----------------------------
+    be_enabled = _as_bool(cfg.get("be_enabled", True), True)
+
+    be_ppl_data_path_raw = _as_str(cfg.get("be_ppl_data_path", ""), "").strip()
+    be_ppl_text_key = _as_str(cfg.get("be_ppl_text_key", "Text"), "Text").strip()
+    be_ppl_max_items_raw = cfg.get("be_ppl_max_items", None)
+    be_ppl_batch_size = _as_int(cfg.get("be_ppl_batch_size", 16), 16)
+    be_ppl_add_start_token = _as_bool(cfg.get("be_ppl_add_start_token", False), False)
+    be_ppl_max_length_raw = cfg.get("be_ppl_max_length", None)
+
+    be_collapse_rel_threshold = float(cfg.get("be_collapse_rel_threshold", 1.5) or 1.5)
+    be_collapse_abs_threshold = cfg.get("be_collapse_abs_threshold", None)
+
+    be_ppl_max_items = None
+    if be_ppl_max_items_raw is not None:
+        be_ppl_max_items = _as_int(be_ppl_max_items_raw, 0)
+        if be_ppl_max_items <= 0:
+            raise ValueError(f"be_ppl_max_items must be > 0 when provided. Got: {be_ppl_max_items_raw}")
+
+    be_ppl_max_length = None
+    if be_ppl_max_length_raw is not None:
+        be_ppl_max_length = _as_int(be_ppl_max_length_raw, 0)
+        if be_ppl_max_length <= 0:
+            raise ValueError(f"be_ppl_max_length must be > 0 when provided. Got: {be_ppl_max_length_raw}")
 
     # ----------------------------
     # Load dataset records
@@ -136,7 +169,6 @@ def main():
     rec_raw = raw_records[sample_index]
     rec = _normalize_record(rec_raw, dataset_type)
 
-    # Minimal dot-access wrapper
     class _Sample:
         def __init__(self, d: Dict[str, Any]):
             self.case_id = d.get("case_id", "")
@@ -153,21 +185,18 @@ def main():
     # ----------------------------
     # Load hparams + build editor
     # ----------------------------
-    print_log("\n[INFO] Loading hparams + building editor...")
+    print_log("\n[INFO] Loading hparams + building editor.")
     print_log(f"[INFO] Using hparams file: {exp_hparams_path}")
 
     force_hf_home()
     hparams = load_hparams(method, str(exp_hparams_path))
 
-    # Force model_name to avoid local-cache weirdness
     hparams.model_name = forced_model_name
 
-    # Avoid custom paths that may conflict with your environment
     for attr in ["model_path", "cache_dir", "model_dir"]:
         if hasattr(hparams, attr):
             setattr(hparams, attr, None)
 
-    # Ensure stats_dir exists if present in hparams (ROME uses it)
     if hasattr(hparams, "stats_dir"):
         stats_dir = getattr(hparams, "stats_dir")
         if stats_dir in (None, "", "null"):
@@ -177,9 +206,32 @@ def main():
     editor: BaseEditor = BaseEditor.from_hparams(hparams)
     tok = get_tokenizer(editor, forced_model_name)
 
-    # Print hparams in a compact table if verbose.
     if verbose:
         print_hparams_table(hparams)
+
+    # ----------------------------
+    # BE: load PPL texts + choose device
+    # ----------------------------
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ppl_texts: List[str] = []
+    ppl_m0 = None
+
+    if be_enabled:
+        if not be_ppl_data_path_raw:
+            raise ValueError("be_enabled=True but 'be_ppl_data_path' is missing in config YAML.")
+
+        be_ppl_data_path = _resolve_path_like_cfg(cfg_path, be_ppl_data_path_raw)
+        if not be_ppl_data_path.exists():
+            raise_path_error("BE PPL dataset file", be_ppl_data_path)
+
+        ppl_texts = load_ppl_texts_from_json(
+            path=be_ppl_data_path,
+            text_key=be_ppl_text_key,
+            max_items=be_ppl_max_items,
+        )
+
+        print_log(f"[INFO] BE enabled. Loaded {len(ppl_texts)} PPL texts from: {be_ppl_data_path}")
+        print_log(f"[INFO] BE device: {device}")
 
     # ----------------------------
     # Print sample summary
@@ -205,10 +257,33 @@ def main():
     print(f"portability_prompts: {len(sample.portability_prompts)}")
 
     # ----------------------------
-    # M0: baseline
+    # BE: PPL on M0 (baseline)
     # ----------------------------
-    print_log("\n[INFO] Behavioral probe (M0)...")
-    comp0 = generate_completion(editor.model, tok, sample_prompt, max_new_tokens=max_new_tokens, temperature=temperature, do_sample=do_sample)
+    if be_enabled:
+        print_log("\n[INFO] BE: computing PPL on M0 (baseline).")
+        ppl_m0, _ = compute_ppl(
+            texts=ppl_texts,
+            model=editor.model,
+            tokenizer=tok,
+            device=device,
+            batch_size=be_ppl_batch_size,
+            add_start_token=be_ppl_add_start_token,
+            max_length=be_ppl_max_length,
+        )
+        print(f"\n=== BE (M0) ===\nmean_ppl: {ppl_m0:.4f}")
+
+    # ----------------------------
+    # M0: behavioral probe
+    # ----------------------------
+    print_log("\n[INFO] Behavioral probe (M0).")
+    comp0 = generate_completion(
+        editor.model,
+        tok,
+        sample_prompt,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        do_sample=do_sample,
+    )
     print("\n=== BEHAVIORAL (M0) ===")
     print(comp0)
 
@@ -220,7 +295,7 @@ def main():
     # Forward edit
     # ----------------------------
     if args.mode in ("forward", "both"):
-        print_log("\n[INFO] Applying FORWARD edit (GT -> NEW)...")
+        print_log("\n[INFO] Applying FORWARD edit (GT -> NEW).")
 
         extra_eval = {}
         if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
@@ -238,10 +313,56 @@ def main():
             suppress_internal_prints=suppress_internal,
             **extra_eval,
         )
+
+        # ----------------------------
+        # BE: PPL on M1 (after forward edit)
+        # ----------------------------
+        if be_enabled and ppl_m0 is not None:
+            print_log("\n[INFO] BE: computing PPL on M1 (after forward edit).")
+            ppl_m1, _ = compute_ppl(
+                texts=ppl_texts,
+                model=edited_model,
+                tokenizer=tok,
+                device=device,
+                batch_size=be_ppl_batch_size,
+                add_start_token=be_ppl_add_start_token,
+                max_length=be_ppl_max_length,
+            )
+            rep = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m1)
+            collapse = is_collapse(
+                rep,
+                rel_threshold=be_collapse_rel_threshold,
+                abs_threshold=be_collapse_abs_threshold,
+            )
+
+            metrics_fwd = metrics_fwd or {}
+            metrics_fwd["butterfly_effect"] = {
+                "stage": "M1_after_forward",
+                **rep.to_dict(),
+                "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
+                "is_collapse": bool(collapse),
+            }
+
+            print(
+                "\n=== BE (M1) ===\n"
+                f"mean_ppl: {ppl_m1:.4f}\n"
+                f"delta_abs: {rep.ppl_delta_abs:.4f}\n"
+                f"delta_rel: {rep.ppl_delta_rel:.4f}\n"
+                f"is_collapse: {collapse}"
+            )
+
         print_metrics_table(metrics_fwd, title="FORWARD METRICS")
 
-        print_log("\n[INFO] Behavioral probe (M1)...")
-        comp1 = generate_completion(edited_model, tok, sample_prompt, max_new_tokens=max_new_tokens)
+        print_log("\n[INFO] Behavioral probe (M1).")
+        comp1 = generate_completion(
+            edited_model,
+            tok,
+            sample_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+        )
         print("\n=== BEHAVIORAL (M1) ===")
         print(comp1)
 
@@ -249,7 +370,7 @@ def main():
     # Inverse / rollback
     # ----------------------------
     if args.mode == "inverse":
-        print_log("\n[INFO] Applying INVERSE edit only (NEW -> GT) on M0...")
+        print_log("\n[INFO] Applying INVERSE edit only (NEW -> GT) on M0.")
 
         extra_eval = {}
         if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
@@ -269,8 +390,15 @@ def main():
         )
         print_metrics_table(metrics_inv, title="INVERSE METRICS")
 
-        print_log("\n[INFO] Behavioral probe (after inverse-only)...")
-        comp2 = generate_completion(inv_model, tok, sample_prompt, max_new_tokens=max_new_tokens)
+        print_log("\n[INFO] Behavioral probe (after inverse-only).")
+        comp2 = generate_completion(
+            inv_model,
+            tok,
+            sample_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+        )
         print("\n=== BEHAVIORAL (after inverse-only) ===")
         print(comp2)
 
@@ -278,10 +406,10 @@ def main():
         if edited_model is None:
             raise RuntimeError("edited_model is None. Forward edit did not run, cannot perform rollback.")
 
-        print_log("\n[INFO] Switching editor to edited model for rollback...")
+        print_log("\n[INFO] Switching editor to edited model for rollback.")
         editor.model = edited_model
 
-        print_log("\n[INFO] Applying INVERSE edit (rollback: NEW -> GT) on M1...")
+        print_log("\n[INFO] Applying INVERSE edit (rollback: NEW -> GT) on M1.")
 
         extra_eval = {}
         if isinstance(sample.locality_prompts, list) and sample.locality_prompts:
@@ -299,10 +427,56 @@ def main():
             suppress_internal_prints=suppress_internal,
             **extra_eval,
         )
+
+        # ----------------------------
+        # BE: PPL on M2 (after rollback)
+        # ----------------------------
+        if be_enabled and ppl_m0 is not None:
+            print_log("\n[INFO] BE: computing PPL on M2 (after rollback).")
+            ppl_m2, _ = compute_ppl(
+                texts=ppl_texts,
+                model=rollback_model,
+                tokenizer=tok,
+                device=device,
+                batch_size=be_ppl_batch_size,
+                add_start_token=be_ppl_add_start_token,
+                max_length=be_ppl_max_length,
+            )
+            rep2 = butterfly_report(ppl_before=ppl_m0, ppl_after=ppl_m2)
+            collapse2 = is_collapse(
+                rep2,
+                rel_threshold=be_collapse_rel_threshold,
+                abs_threshold=be_collapse_abs_threshold,
+            )
+
+            metrics_inv = metrics_inv or {}
+            metrics_inv["butterfly_effect"] = {
+                "stage": "M2_after_rollback",
+                **rep2.to_dict(),
+                "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
+                "is_collapse": bool(collapse2),
+            }
+
+            print(
+                "\n=== BE (M2) ===\n"
+                f"mean_ppl: {ppl_m2:.4f}\n"
+                f"delta_abs: {rep2.ppl_delta_abs:.4f}\n"
+                f"delta_rel: {rep2.ppl_delta_rel:.4f}\n"
+                f"is_collapse: {collapse2}"
+            )
+
         print_metrics_table(metrics_inv, title="INVERSE (ROLLBACK) METRICS")
 
-        print_log("\n[INFO] Behavioral probe (M2)...")
-        comp2 = generate_completion(rollback_model, tok, sample_prompt, max_new_tokens=max_new_tokens)
+        print_log("\n[INFO] Behavioral probe (M2).")
+        comp2 = generate_completion(
+            rollback_model,
+            tok,
+            sample_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=do_sample,
+        )
         print("\n=== BEHAVIORAL (M2) ===")
         print(comp2)
 
