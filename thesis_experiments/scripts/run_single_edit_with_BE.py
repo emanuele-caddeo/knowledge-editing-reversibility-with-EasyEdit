@@ -1,3 +1,6 @@
+from time import perf_counter
+from datetime import datetime
+import json
 import sys
 import inspect
 from pathlib import Path
@@ -24,6 +27,11 @@ from thesis_experiments.scripts.utils_io import (
     _as_str,
     _as_int,
     _as_bool,
+    save_results_json,
+    _is_cuda_oom,
+    _log_stats_cache_status,
+    log_step,
+    set_start_time
 )
 
 from thesis_experiments.scripts.pretty_print_utilities import (
@@ -48,73 +56,12 @@ from ke_core import (
 )
 
 from easyeditor import BaseEditor
-
+startTime = str(datetime.now().isoformat()).replace(":", "")
+set_start_time(startTime)
 
 # ----------------------------
 # Unified logging helper
 # ----------------------------
-def log_step(message: str, level: str = "INFO") -> None:
-    """
-    Unified logger for this script.
-    - level: "INFO", "WARNING", "ERROR"
-    Internally delegates to `print_log` so the main stays clean.
-    """
-    lvl = (level or "INFO").strip().upper()
-    if lvl not in ("INFO", "WARNING", "ERROR"):
-        lvl = "INFO"
-    print_log(f"[{lvl}] {message}")
-
-
-def _is_cuda_oom(exc: BaseException) -> bool:
-    """Detect CUDA OOM in a simple and robust way."""
-    s = str(exc).lower()
-    return ("out of memory" in s) or ("cuda oom" in s)
-
-
-def _log_stats_cache_status(hparams) -> None:
-    """
-    Best-effort cache logging for ROME/MEMIT stats (mom2 / covariance files).
-    EasyEdit doesn't expose a universal callback, so we infer from stats_dir content.
-    """
-    if not hasattr(hparams, "stats_dir"):
-        return
-
-    stats_dir = getattr(hparams, "stats_dir", None)
-    if not stats_dir:
-        log_step("hparams.stats_dir is empty/None. Stats caching is not available.", "WARNING")
-        return
-
-    p = Path(str(stats_dir))
-    if not p.exists():
-        log_step(f"stats_dir does not exist yet: {p}", "WARNING")
-        return
-
-    # Heuristic: look for typical stats files/folders.
-    # Different pipelines name them differently; we keep it permissive.
-    candidates = []
-    # Common folder in some repos: wikipedia_stats/
-    if (p / "wikipedia_stats").exists():
-        candidates.append(p / "wikipedia_stats")
-
-    # Generic: any file containing "mom2" or "cov" or "stats"
-    for f in p.rglob("*"):
-        name = f.name.lower()
-        if any(k in name for k in ("mom2", "cov", "stats")):
-            candidates.append(f)
-            # Don't spam; stop early.
-            if len(candidates) >= 5:
-                break
-
-    if candidates:
-        log_step(f"Stats cache appears present in stats_dir (using cached moments/stats). Example: {candidates[0]}", "INFO")
-    else:
-        log_step(
-            "No obvious stats/mom2/cov files found in stats_dir. "
-            "If ROME/MEMIT needs them, it may compute or fail depending on config.",
-            "WARNING",
-        )
-
-
 def _call_apply_edit(editor: BaseEditor, **kwargs):
     """
     Call apply_edit(...) safely:
@@ -136,7 +83,6 @@ def _call_apply_edit(editor: BaseEditor, **kwargs):
 
     return apply_edit(editor, **filtered)
 
-
 def main():
     parser = argparse.ArgumentParser(
         description="Run sample with forward + inverse (rollback) + Butterfly Effect (PPL)."
@@ -144,6 +90,33 @@ def main():
     parser.add_argument("--config", required=True, help="Path to experiment config YAML")
     parser.add_argument("--mode", default="both", choices=["forward", "inverse", "both"])
     args = parser.parse_args()
+    t0 = perf_counter()
+
+    results_json: Dict[str, Any] = {
+        "timestamp_utc": datetime.utcnow().isoformat(),
+        "elapsed_sec": None,  # filled only at the very end
+        "config_path": str(Path(args.config)),
+        "mode": args.mode,
+        "method": None,
+        "dataset_type": None,
+        "dataset_source": None,
+        "dataset_size_loaded": None,
+        "sample_index": None,
+        "case_id": None,
+        "prompt": None,
+        "subject": None,
+        "ground_truth": None,
+        "target_new": None,
+        "counts": {
+            "locality_prompts": None,
+            "portability_prompts": None,
+            "ppl_texts": None,
+        },
+        "ppl": {},       # M0/M1/M2 mean_ppl
+        "be_report": {}, # M1/M2 report dicts (delta_abs/delta_rel/collapse)
+        "metrics": {},   # forward/inverse_only/rollback
+    }
+
 
     # ----------------------------
     # Experiment config loading
@@ -223,7 +196,7 @@ def main():
     # ----------------------------
     # Load dataset records
     # ----------------------------
-    log_step(f"Loading records (dataset_type={dataset_type})...")
+    log_step(f"Loading records (dataset_type={dataset_type})...", "INFO")
     raw_records, dataset_source = _load_records(cfg_path, cfg)
 
     if not raw_records:
@@ -324,6 +297,7 @@ def main():
         )
 
         log_step(f"BE enabled. Loaded {len(ppl_texts)} PPL texts from: {be_ppl_data_path}")
+        results_json["counts"]["ppl_texts"] = len(ppl_texts)
         if be_ppl_max_length is None:
             log_step("be_ppl_max_length is None. Long sequences may slow down PPL a lot.", "WARNING")
 
@@ -351,6 +325,25 @@ def main():
     print(f"portability_prompts: {len(sample.portability_prompts)}\n")
 
     # ----------------------------
+    # Populate results metadata (for results.json)
+    # ----------------------------
+    results_json.update({
+        "method": method,
+        "dataset_type": dataset_type,
+        "dataset_source": dataset_source,
+        "dataset_size_loaded": len(raw_records),
+        "sample_index": sample_index,
+        "case_id": sample.case_id,
+        "prompt": sample_prompt,
+        "subject": sample.subject,
+        "ground_truth": sample.ground_truth,
+        "target_new": sample.target_new,
+    })
+    results_json["counts"]["locality_prompts"] = len(sample.locality_prompts)
+    results_json["counts"]["portability_prompts"] = len(sample.portability_prompts)
+
+
+    # ----------------------------
     # BE: PPL on M0 (baseline)
     # ----------------------------
     if be_enabled:
@@ -366,6 +359,7 @@ def main():
                 max_length=be_ppl_max_length,
             )
             print(f"\n=== BE (M0) ===\nmean_ppl: {ppl_m0:.4f}")
+            results_json["ppl"]["M0"] = float(ppl_m0)
         except RuntimeError as e:
             if _is_cuda_oom(e):
                 log_step("Aborted: CUDA OOM while computing PPL on M0.", "ERROR")
@@ -426,6 +420,8 @@ def main():
                 return
             raise
 
+        results_json["metrics"]["forward"] = metrics_fwd
+
         # Ensure edited model is on the right device for PPL / generation
         try:
             log_step("Moving edited model to device (may take time).")
@@ -479,6 +475,14 @@ def main():
                     f"delta_rel: {rep.ppl_delta_rel:.4f}\n"
                     f"is_collapse: {collapse}"
                 )
+
+                results_json["ppl"]["M1"] = float(ppl_m1)
+                results_json["be_report"]["M1"] = {
+                    **rep.to_dict(),
+                    "is_collapse": bool(collapse),
+                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
+                }
             except RuntimeError as e:
                 if _is_cuda_oom(e):
                     log_step("Aborted: CUDA OOM while computing PPL on M1.", "ERROR")
@@ -535,6 +539,7 @@ def main():
                 return
             raise
 
+        results_json["metrics"]["inverse_only"] = metrics_inv
         print_metrics_table(metrics_inv, title="INVERSE METRICS")
 
         try:
@@ -590,6 +595,8 @@ def main():
                 return
             raise
 
+        results_json["metrics"]["rollback"] = metrics_inv
+
         # Ensure rollback model is on the right device
         try:
             log_step("Moving rollback model to device (may take time).")
@@ -642,6 +649,14 @@ def main():
                     f"delta_rel: {rep2.ppl_delta_rel:.4f}\n"
                     f"is_collapse: {collapse2}"
                 )
+
+                results_json["ppl"]["M2"] = float(ppl_m2)
+                results_json["be_report"]["M2"] = {
+                    **rep2.to_dict(),
+                    "is_collapse": bool(collapse2),
+                    "collapse_rel_threshold": float(be_collapse_rel_threshold),
+                    "collapse_abs_threshold": (float(be_collapse_abs_threshold) if be_collapse_abs_threshold is not None else None),
+                }
             except RuntimeError as e:
                 if _is_cuda_oom(e):
                     log_step("Aborted: CUDA OOM while computing PPL on M2.", "ERROR")
@@ -667,6 +682,13 @@ def main():
                 log_step("Aborted: CUDA OOM during behavioral probe (M2).", "ERROR")
                 return
             raise
+
+    # ----------------------------
+    # Finalize + persist results.json ONLY after everything is computed
+    # ----------------------------
+    results_json["elapsed_sec"] = float(perf_counter() - t0)
+    save_results_json( results_json, path="logs/logs-" + startTime+"/results.json")
+    log_step(f"Saved metrics JSON to logs/logs-{startTime}/results.json (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
 
 
 if __name__ == "__main__":

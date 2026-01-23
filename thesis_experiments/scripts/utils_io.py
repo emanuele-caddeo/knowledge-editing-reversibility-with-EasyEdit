@@ -3,6 +3,7 @@ import sys
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
 
 
 # ------------------------------------------------------------
@@ -476,6 +477,13 @@ def _load_from_hf_files(hf_dataset: str, hf_split: str) -> List[Dict[str, Any]]:
 
     raise ValueError(f"Unsupported dataset structure in downloaded file: {picked}")
 
+def set_start_time(start_time: str) -> None:
+    """
+    Set the global START_TIME variable for logging.
+    """
+    global START_TIME
+    START_TIME = start_time
+
 def print_log(log_msg: str) -> None:
     """
     Print a log message in gray color to the console.
@@ -484,6 +492,98 @@ def print_log(log_msg: str) -> None:
     GRAY = "\033[90m"
     RESET = "\033[0m"
     print(f"{GRAY}{log_msg}{RESET}")
+
+def log_step(message: str, level: str = "INFO", start_time: str = START_TIME) -> None:
+    """
+    Unified logger for this script.
+    - level: "INFO", "WARNING", "ERROR"
+    Internally delegates to `print_log` so the main stays clean.
+    """
+    lvl = (level or "INFO").strip().upper()
+    if lvl not in ("INFO", "WARNING", "ERROR"):
+        lvl = "INFO"
+    print_log(f"[{lvl}] {message}")
+
+    # Log to file
+    log_file = Path(f"logs/logs-{start_time}/run.log")
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Avoid crashing if cwd is not a parent of __file__
+    try:
+        script_id = str(Path(__file__).resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        script_id = str(Path(__file__).resolve())
+
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(f"[{lvl}] {datetime.now().isoformat()} - {script_id} {message}\n")
+
+def _json_safe(obj: Any) -> Any:
+    """Best-effort conversion to JSON-serializable types."""
+    try:
+        json.dumps(obj)
+        return obj
+    except Exception:
+        if isinstance(obj, dict):
+            return {str(k): _json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_json_safe(v) for v in obj]
+        return str(obj)
+
+def save_results_json(payload: Dict[str, Any], path: Path = Path("logs/results.json")) -> None:
+
+    data: List[Dict[str, Any]] = []
+    data.append(_json_safe(payload))
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Detect CUDA OOM in a simple and robust way."""
+    s = str(exc).lower()
+    return ("out of memory" in s) or ("cuda oom" in s)
+
+def _log_stats_cache_status(hparams) -> None:
+    """
+    Best-effort cache logging for ROME/MEMIT stats (mom2 / covariance files).
+    EasyEdit doesn't expose a universal callback, so we infer from stats_dir content.
+    """
+    if not hasattr(hparams, "stats_dir"):
+        return
+
+    stats_dir = getattr(hparams, "stats_dir", None)
+    if not stats_dir:
+        log_step("hparams.stats_dir is empty/None. Stats caching is not available.", "WARNING")
+        return
+
+    p = Path(str(stats_dir))
+    if not p.exists():
+        log_step(f"stats_dir does not exist yet: {p}", "WARNING")
+        return
+
+    # Heuristic: look for typical stats files/folders.
+    # Different pipelines name them differently; we keep it permissive.
+    candidates = []
+    # Common folder in some repos: wikipedia_stats/
+    if (p / "wikipedia_stats").exists():
+        candidates.append(p / "wikipedia_stats")
+
+    # Generic: any file containing "mom2" or "cov" or "stats"
+    for f in p.rglob("*"):
+        name = f.name.lower()
+        if any(k in name for k in ("mom2", "cov", "stats")):
+            candidates.append(f)
+            # Don't spam; stop early.
+            if len(candidates) >= 5:
+                break
+
+    if candidates:
+        log_step(f"Stats cache appears present in stats_dir (using cached moments/stats). Example: {candidates[0]}", "INFO")
+    else:
+        log_step(
+            "No obvious stats/mom2/cov files found in stats_dir. "
+            "If ROME/MEMIT needs them, it may compute or fail depending on config.",
+            "WARNING",
+        )
 
 def _as_bool(v, default=False) -> bool:
     """Parse common YAML bool representations safely."""
