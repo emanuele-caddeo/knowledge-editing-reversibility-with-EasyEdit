@@ -17,6 +17,9 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
+# Global variable for tracking start time in logging
+START_TIME: str = ""
+
 def read_json_any(path: str) -> Any:
     """Read JSON or JSONL (one JSON object per line)."""
     p = Path(path)
@@ -493,12 +496,15 @@ def print_log(log_msg: str) -> None:
     RESET = "\033[0m"
     print(f"{GRAY}{log_msg}{RESET}")
 
-def log_step(message: str, level: str = "INFO", start_time: str = START_TIME) -> None:
+def log_step(message: str, level: str = "INFO", start_time: Optional[str] = None) -> None:
     """
     Unified logger for this script.
     - level: "INFO", "WARNING", "ERROR"
     Internally delegates to `print_log` so the main stays clean.
     """
+    if start_time is None:
+        start_time = START_TIME
+    
     lvl = (level or "INFO").strip().upper()
     if lvl not in ("INFO", "WARNING", "ERROR"):
         lvl = "INFO"

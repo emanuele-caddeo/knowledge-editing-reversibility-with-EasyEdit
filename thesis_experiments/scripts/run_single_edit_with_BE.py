@@ -690,6 +690,5 @@ def main():
     save_results_json( results_json, path="logs/logs-" + startTime+"/results.json")
     log_step(f"Saved metrics JSON to logs/logs-{startTime}/results.json (elapsed_sec={results_json['elapsed_sec']:.3f}).", "INFO")
 
-
 if __name__ == "__main__":
     main()
