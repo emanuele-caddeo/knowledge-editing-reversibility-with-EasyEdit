@@ -8,6 +8,9 @@ import argparse
 import yaml
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
+from datasets import load_dataset
+import json
+
 
 import torch
 
@@ -58,6 +61,88 @@ from ke_core import (
 from easyeditor import BaseEditor
 startTime = str(datetime.now().isoformat()).replace(":", "")
 set_start_time(startTime)
+
+def _load_counterfact_with_local_priority(
+    cfg_path: Path,
+    cfg: dict,
+    allow_hf_fallback: bool,
+):
+    """
+    Load CounterFact with priority:
+    - If exp_local_dataset is set:
+        * load from local path if it exists
+        * if it does NOT exist:
+            - fallback to HF only if allow_hf_fallback=True
+            - otherwise raise a hard error
+    - If exp_local_dataset is null:
+        * load from HF only if allow_hf_fallback=True
+        * otherwise raise a hard error
+    """
+
+    local_path_raw = cfg.get("exp_local_dataset", None)
+    
+    # ----------------------------
+    # Case 1: local dataset specified
+    # ----------------------------
+    if local_path_raw:
+        local_path = _resolve_path_like_cfg(cfg_path, local_path_raw)
+
+        if local_path.exists():
+            log_step(f"Loading CounterFact from LOCAL path: {local_path}", "INFO")
+
+            with local_path.open("r", encoding="utf-8") as f:
+                records = json.load(f)
+
+            if not isinstance(records, list):
+                raise ValueError(
+                    f"Local CounterFact dataset must be a JSON list: {local_path}"
+                )
+
+            return records, "local"
+
+        # Local path specified but NOT found
+        msg = f"Local CounterFact dataset not found at path: {local_path}"
+
+        if not allow_hf_fallback:
+            raise FileNotFoundError(
+                msg
+                + " | HF fallback is disabled (exp_allow_hf_fallback=false)."
+            )
+
+        log_step(
+            msg + " — falling back to HuggingFace (allowed).",
+            "WARNING",
+        )
+
+    # ----------------------------
+    # Case 2: HF fallback
+    # ----------------------------
+    if not allow_hf_fallback:
+        raise RuntimeError(
+            "HF fallback is disabled (exp_allow_hf_fallback=false) "
+            "and no valid local CounterFact dataset was provided."
+        )
+
+    hf_dataset = cfg.get("hf_dataset", None)
+    hf_split = cfg.get("hf_split", "test")
+    hf_subset = cfg.get("hf_subset", None)
+
+    if not hf_dataset:
+        raise ValueError(
+            "HF fallback requested but 'hf_dataset' is missing in config."
+        )
+
+    log_step(
+        f"Loading CounterFact from HF: {hf_dataset} "
+        f"(split={hf_split}, subset={hf_subset})",
+        "INFO",
+    )
+
+    ds = load_dataset(hf_dataset, hf_subset, split=hf_split)
+    records = [dict(r) for r in ds]
+
+    return records, "hf"
+
 
 # ----------------------------
 # Unified logging helper
@@ -197,7 +282,19 @@ def main():
     # Load dataset records
     # ----------------------------
     log_step(f"Loading records (dataset_type={dataset_type})...", "INFO")
-    raw_records, dataset_source = _load_records(cfg_path, cfg)
+
+    if dataset_type == "counterfact":
+        allow_hf_fallback = _as_bool(
+            cfg.get("exp_allow_hf_fallback", True), True
+        )
+
+        raw_records, dataset_source = _load_counterfact_with_local_priority(
+            cfg_path=cfg_path,
+            cfg=cfg,
+            allow_hf_fallback=allow_hf_fallback,
+        )
+    else:
+        raw_records, dataset_source = _load_records(cfg_path, cfg)
 
     if not raw_records:
         raise RuntimeError("No records loaded from dataset (empty list).")
