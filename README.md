@@ -3,7 +3,28 @@
 This repository contains the experimental framework developed for the Master's Thesis on **reversibility in Knowledge Editing (KE)** for Large Language Models (LLMs).
 The project investigates how factual edits applied to a model can be **applied, evaluated, and reverted**, while analyzing **side effects** on unrelated knowledge using Butterfly Effect–style metrics.
 
-The framework is built on top of **EasyEdit** and supports editing methods such as **ROME** and **MEMIT**, with experiments conducted on autoregressive language models (e.g., GPT-2-XL, GPT-J).
+The framework is built on top of **EasyEdit** and supports editing methods such as **ROME** and **MEMIT**, with experiments conducted on autoregressive language models (e.g., GPT-2-XL, GPT-J, LLaMA).
+
+---
+
+## Index
+
+* [1. Project Goals](#1-project-goals)
+* [2. Background Concepts](#2-background-concepts)
+
+  * [2.1 Knowledge Editing](#21-knowledge-editing)
+  * [2.2 ROME (Rank-One Model Editing)](#22-rome-rank-one-model-editing)
+  * [2.3 MEMIT (Mass Editing Memory in Transformers)](#23-memit-mass-editing-memory-in-transformers)
+  * [2.4 Butterfly Effect in Knowledge Editing](#24-butterfly-effect-in-knowledge-editing)
+* [3. Repository Structure](#3-repository-structure)
+* [4. Getting Started (Linux Only)](#4-getting-started-linux-only)
+
+  * [4.1 Install Anaconda / Miniconda](#41-install-anaconda--miniconda)
+  * [4.2 Obtain the Repository](#42-obtain-the-repository)
+  * [4.3 Create the Python Environment](#43-create-the-python-environment)
+  * [4.4 Configure the Experiment (YAML)](#44-configure-the-experiment-yaml)
+  * [4.5 Run the Reference Script](#45-run-the-reference-script)
+  * [4.6 Logs and Results](#46-logs-and-results)
 
 ---
 
@@ -75,27 +96,49 @@ This project explicitly measures these effects.
 
 ---
 
-## 3. Repository Structure (to be updated)
+## 3. Repository Structure
 
 ```text
-thesis_experiments/
+.
+├── easyeditor
+│   └── <edit mechanisms>
 │
-├── configs/                # YAML experiment and hyperparameter configs
-│   ├── suite_*_rome.yaml
-│   ├── suite_*_memit.yaml
-│   └── hparams_*.yaml
+├── hparams
+│   ├── AlphaEdit
+│   ├── FT
+│   ├── KN
+│   ├── MELO
+│   ├── MEMIT
+│   ├── MEND
+│   └── ROME
 │
-├── data/
-│   └── me_ppl/
-|       ├── ME-PPL_1k.json
-|       └── ME-PPL_50.json
+├── logs
+│   └── logs-YYYY-MM-DDTime*
+│       ├── run.log
+│       └── results.json
 │
-└── scripts/
-    ├── run_single_edit.py  # Single edit experiment
-    ├── butterfly_effect.py
-    └── dataset_*.py
-      └── old/
-          └── run*.py
+└── thesis_experiments
+    ├── configs
+    │   ├── exp_*.yaml
+    │   └── hparams_*.yaml
+    │
+    ├── data
+    │   └── counterfact
+    │
+    ├── notebooks
+    │
+    ├── scripts
+    │   ├── butterfly_effect_ppl.py
+    │   ├── ke_core.py
+    │   ├── pretty_print_utilities.py
+    │   ├── run_single_edit_with_BE.py
+    │   └── utils_io.py
+    │
+    └── stats
+        ├── gpt2-xl
+        │   └── wikipedia_stats
+        └── Llama-3.2-3B
+            └── wikipedia_stats
 ```
 
 ---
@@ -105,17 +148,6 @@ thesis_experiments/
 > **Important note**
 > This setup guide currently targets **Linux systems only**.
 > A dedicated guide for **Windows 11** will be provided in a future update.
-
-### Index
-
-* [4.1 Install Anaconda / Miniconda](#41-install-anaconda--miniconda)
-* [4.2 Obtain the Repository](#42-obtain-the-repository)
-* [4.3 Create the Python Environment](#43-create-the-python-environment)
-* [4.4 Configure the Experiment (YAML)](#44-configure-the-experiment-yaml)
-* [4.5 Run the Reference Script](#45-run-the-reference-script)
-* [4.6 Logs and Results](#46-logs-and-results)
-
----
 
 ### 4.1 Install Anaconda / Miniconda
 
@@ -149,8 +181,6 @@ cd knowledge-editing-reversibility-with-EasyEdit
 
 #### Option B — Use a ZIP archive
 
-If you already have the repository as a ZIP file:
-
 ```bash
 unzip knowledge-editing-reversibility-with-EasyEdit.zip
 cd knowledge-editing-reversibility-with-EasyEdit
@@ -173,44 +203,19 @@ Install all required dependencies using the provided `requirements.txt` file:
 pip install -r requirements.txt
 ```
 
-> **Note**: Depending on your hardware and CUDA setup, PyTorch may install either CPU or GPU builds.
-
 ---
 
 ### 4.4 Configure the Experiment (YAML)
 
-The framework is fully configured through **YAML files**.
-
-Experiment-level configuration files are located in:
+The framework is fully configured through **YAML files** located in:
 
 ```text
 thesis_experiments/configs/
 ```
 
-As a reference example, inspect and adapt:
-
-```text
-thesis_experiments/configs/exp_counterfact_hf_llama32_3b_rome_single.yaml
-```
-
-This file controls:
-
-* Dataset source (local vs HuggingFace)
-* Model selection
-* Editing method (ROME / MEMIT)
-* Butterfly Effect (PPL) evaluation
-
-Make sure paths inside the YAML follow **Linux-style conventions**, e.g.:
-
-```yaml
-exp_local_dataset: data/counterfact/test.json
-```
-
 ---
 
 ### 4.5 Run the Reference Script
-
-From the project root, launch the main experiment script:
 
 ```bash
 python -m thesis_experiments.scripts.run_single_edit_with_BE \
@@ -218,22 +223,9 @@ python -m thesis_experiments.scripts.run_single_edit_with_BE \
   --mode both
 ```
 
-#### First run note (ROME statistics)
-
-On the **first execution**, if the statistics file required by ROME is **not already present** (e.g. for a given `mom2_n_samples` value specified in the YAML), the framework will automatically compute it.
-
-This step:
-
-* Can take **a long time**
-* Becomes especially expensive for large values (e.g. `mom2_n_samples = 10000`)
-
-This is expected behavior and only happens once per configuration.
-
 ---
 
 ### 4.6 Logs and Results
-
-During and after execution, you will see detailed logs printed to stdout.
 
 All experiment artifacts are saved under:
 
@@ -241,12 +233,4 @@ All experiment artifacts are saved under:
 logs/
 ```
 
-Each run creates a timestamped subdirectory containing:
-
-* Execution logs
-* Metrics (`results.json`)
-* Butterfly Effect reports
-
-These outputs are the primary data used for analysis and for the thesis evaluation.
-
----
+Each run creates a timestamped subdirectory containing logs, metrics, and Butterfly Effect reports.
